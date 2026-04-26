@@ -36,8 +36,8 @@ func (res ErrorResponse) Send(c *gin.Context) {
 type SuccessResponse struct {
 	StatusCode int         `json:"statusCode,omitempty"`
 	Message    string      `json:"message"`
-	Data       interface{} `json:"data,omitempty"`     // data payload
-	Metadata   interface{} `json:"metadata,omitempty"` //pagination and other payload
+	Data       interface{} `json:"data,omitempty"`
+	Metadata   interface{} `json:"metadata,omitempty"`
 }
 
 func NewSuccessResponse(message string, data interface{}, metadata interface{}) *SuccessResponse {

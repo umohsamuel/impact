@@ -57,7 +57,6 @@ func (g *GoogleAI) UploadFiles(files []llm.File) ([]llm.UploadedFile, error) {
 		err   error
 	}
 
-	// Limit concurrency to 5 to avoid rate-limiting / nil responses
 	const maxConcurrent = 5
 	sem := make(chan struct{}, maxConcurrent)
 	ch := make(chan result, len(files))
