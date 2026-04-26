@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/umohsamuel/impact/internals/configs/connections"
 	"github.com/umohsamuel/impact/internals/configs/env"
 	configs "github.com/umohsamuel/impact/internals/configs/goth"
-	"github.com/umohsamuel/impact/internals/configs/logger"
 	"github.com/umohsamuel/impact/internals/infrastructures/adapters"
 	"github.com/umohsamuel/impact/internals/infrastructures/db"
 	"github.com/umohsamuel/impact/internals/infrastructures/ports"
@@ -23,7 +23,6 @@ func init() {
 }
 
 func main() {
-	newLogger := logger.NewSugarLogger(environmentVariables.ProductionEnvironment)
 
 	ctx := context.Background()
 
@@ -37,23 +36,19 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	logger.NewSugarLogger(false).LogWithFields("info", "db connected successfully!!!")
 	defer rows.Close()
 
-	for rows.Next() {
-		var now string
-		rows.Scan(&now)
-		fmt.Println("DB time:", now)
-	}
+	fmt.Println("---- db connected successfully!!! ----")
+
+	newGoogleGenAIClient := connections.NewGoogleGenAIClient(environmentVariables)
 
 	adapterDependencies := adapters.AdapterDependencies{
-		Logger:               newLogger,
 		EnvironmentVariables: environmentVariables,
 		DB:                   pool,
+		GoogleGenAIClient:    newGoogleGenAIClient,
 	}
 	newAdapters := adapters.NewAdapters(adapterDependencies)
 	newServices := services.NewServices(newAdapters)
-	newPort := ports.NewPort(newServices, newLogger, environmentVariables)
+	newPort := ports.NewPort(newServices, environmentVariables)
 	newPort.GinServer.Engine.Run()
 }

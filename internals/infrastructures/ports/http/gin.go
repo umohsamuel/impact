@@ -6,16 +6,15 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/umohsamuel/impact/internals/configs/env"
-	"github.com/umohsamuel/impact/internals/configs/logger"
 	"github.com/umohsamuel/impact/internals/configs/response"
 	"github.com/umohsamuel/impact/internals/infrastructures/db/gen"
+	"github.com/umohsamuel/impact/internals/infrastructures/ports/http/handlers"
 	"github.com/umohsamuel/impact/internals/services"
 )
 
 type GinServer struct {
 	Services    *services.Services
 	Engine      *gin.Engine
-	Logger      logger.Logger
 	Environment *env.EnvironmentVariables
 }
 
@@ -23,12 +22,11 @@ type apiConfig struct {
 	DB *gen.Queries
 }
 
-func NewGinServer(services *services.Services, logger logger.Logger, environment *env.EnvironmentVariables) *GinServer {
+func NewGinServer(services *services.Services, environment *env.EnvironmentVariables) *GinServer {
 
 	ginServer := &GinServer{
 		Services:    services,
 		Engine:      gin.Default(),
-		Logger:      logger,
 		Environment: environment,
 	}
 
@@ -42,8 +40,13 @@ func NewGinServer(services *services.Services, logger logger.Logger, environment
 
 	ginServer.Engine.Use(cors.New(config))
 
+	ginServer.Engine.Static("/downloads", "tmp")
+
 	ginServer.Health()
-	ginServer.User()
+
+	api := ginServer.Engine.Group("/api/v1")
+	ginServer.User(api)
+	ginServer.Ffmpeg(api)
 
 	return ginServer
 
@@ -59,9 +62,9 @@ type CreateUserRequest struct {
 	Name string `json:"name"`
 }
 
-func (server *GinServer) User() {
+func (server *GinServer) User(rg *gin.RouterGroup) {
 
-	server.Engine.POST("/create/user", func(c *gin.Context) {
+	rg.POST("/create/user", func(c *gin.Context) {
 
 		var user CreateUserRequest
 
@@ -82,4 +85,11 @@ func (server *GinServer) User() {
 
 		response.NewSuccessResponse("success", updatedUser, nil).Send(c)
 	})
+
+}
+
+func (server *GinServer) Ffmpeg(rg *gin.RouterGroup) {
+	ffmpegHandler := handlers.NewFFMPEGHandler(server.Environment, server.Services.LLMImplementation)
+
+	rg.POST("/generate-impact-frames", ffmpegHandler.ExtractFrames)
 }

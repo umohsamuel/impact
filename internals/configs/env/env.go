@@ -44,6 +44,13 @@ type OAuthProvider struct {
 	Github *GithubOAuth
 }
 
+type GoogleGenerativeAI struct {
+	APIKEY    string
+	Model     string
+	FastModel string
+	LiveModel string
+}
+
 type EnvironmentVariables struct {
 	Port                  string
 	JWTSecret             string
@@ -63,6 +70,7 @@ type EnvironmentVariables struct {
 	PostgresDB            *PostgresDB
 	SMTP                  *SMTP
 	OAuthProvider         *OAuthProvider
+	Gemini                *GoogleGenerativeAI
 }
 
 func loadEnv() {
@@ -119,6 +127,13 @@ func LoadEnvironment() *EnvironmentVariables {
 				GithubSecret:   getEnvOrError("GITHUB_CLIENT_SECRET"),
 				GithubCallback: getEnvOrError("GITHUB_CALLBACK_URL"),
 			},
+		},
+
+		Gemini: &GoogleGenerativeAI{
+			APIKEY:    getEnvOrError("GOOGLE_API_KEY"),
+			Model:     getEnvOrError("GEMINI_MODEL"),
+			FastModel: getEnvOrError("GEMINI_FAST_MODEL"),
+			LiveModel: getEnvOrError("GEMINI_LIVE_MODEL"),
 		},
 	}
 }
