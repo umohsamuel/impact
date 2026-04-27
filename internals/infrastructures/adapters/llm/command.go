@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/umohsamuel/impact/internals/configs/env"
@@ -138,8 +139,11 @@ func (g *GoogleAI) GenerateText(prompt string, useFastModel bool, uploadedFiles 
 		ThinkingConfig: &genai.ThinkingConfig{
 			ThinkingLevel: genai.ThinkingLevelHigh,
 		},
-		Tools: []*genai.Tool{
-			{GoogleSearch: &genai.GoogleSearch{}},
+		SafetySettings: []*genai.SafetySetting{
+			{Category: genai.HarmCategoryHarassment, Threshold: genai.HarmBlockThresholdOff},
+			{Category: genai.HarmCategoryHateSpeech, Threshold: genai.HarmBlockThresholdOff},
+			{Category: genai.HarmCategoryDangerousContent, Threshold: genai.HarmBlockThresholdOff},
+			{Category: genai.HarmCategorySexuallyExplicit, Threshold: genai.HarmBlockThresholdOff},
 		},
 	}
 
@@ -149,7 +153,34 @@ func (g *GoogleAI) GenerateText(prompt string, useFastModel bool, uploadedFiles 
 	}
 
 	text := response.Text()
+	if text == "" && response.Candidates != nil {
+		for _, candidate := range response.Candidates {
+			if candidate.Content == nil {
+				continue
+			}
+			for _, part := range candidate.Content.Parts {
+				if part.Text != "" && !part.Thought {
+					text += part.Text
+				}
+			}
+		}
+	}
+
 	if text == "" {
+		log.Printf("[llm debug] empty response. candidates=%d", len(response.Candidates))
+		if response.PromptFeedback != nil {
+			log.Printf("[llm debug] prompt_feedback block_reason=%v", response.PromptFeedback.BlockReason)
+		}
+		for i, c := range response.Candidates {
+			log.Printf("[llm debug] candidate %d: finish_reason=%s", i, c.FinishReason)
+			if c.Content != nil {
+				for j, p := range c.Content.Parts {
+					log.Printf("[llm debug]   part %d: thought=%v text_len=%d inline_data=%v", j, p.Thought, len(p.Text), p.InlineData != nil)
+				}
+			} else {
+				log.Printf("[llm debug]   content is nil")
+			}
+		}
 		return nil, errors.New("failed to generate text: empty response")
 	}
 

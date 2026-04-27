@@ -9,27 +9,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-
-	video "github.com/umohsamuel/impact/internals/infrastructures/domain/video"
 )
 
-type FrameExtractionConfig struct {
-	InputPath  string
-	OutputDir  string
-	SampleRate float64 // frames per second to extract (e.g. 1.0 = 1 frame/sec, 2.0 = 2 frames/sec)
-	MaxWidth   int     // resize width, 0 = no resize
-	MaxHeight  int     // resize height, 0 = no resize
-	Quality    int     // JPEG quality 1-31 (lower = better quality in FFmpeg)
-}
-
-type ExtractedFrames struct {
-	Paths       []string
-	FrameCount  int
-	FPS         float64
-	DurationMs  int64
-	TotalFrames int64
-	OutputDir   string
-}
+const (
+	gridCols      = 5
+	gridRows      = 4
+	framesPerGrid = gridCols * gridRows
+)
 
 type VideoMetadata struct {
 	FPS         float64
@@ -39,41 +25,33 @@ type VideoMetadata struct {
 	Height      int
 }
 
-// ExtractFrames extracts sampled frames from a video as JPEGs
-func ExtractFrames(cfg FrameExtractionConfig) (*ExtractedFrames, error) {
-	// Create output directory
-	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
+type ExtractedFrames struct {
+	Paths       []string
+	FrameCount  int
+	FPS         float64
+	DurationMs  int64
+	TotalFrames int64
+	SampleRate  float64
+	OutputDir   string
+}
+
+func ExtractAndLabelFrames(inputPath, outputDir string, sampleRate float64) (*ExtractedFrames, error) {
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create output dir: %w", err)
 	}
 
-	// Build filter string
-	filters := []string{
-		fmt.Sprintf("fps=%g", cfg.SampleRate), // sample at desired rate
-	}
-
-	if cfg.MaxWidth > 0 || cfg.MaxHeight > 0 {
-		w := cfg.MaxWidth
-		h := cfg.MaxHeight
-		if w == 0 {
-			w = -1 // maintain aspect ratio
-		}
-		if h == 0 {
-			h = -1
-		}
-		// scale down only, never upscale
-		filters = append(filters, fmt.Sprintf(
-			"scale=%d:%d:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
-			w, h,
-		))
-	}
-
-	filterStr := strings.Join(filters, ",")
-	outputPattern := filepath.Join(cfg.OutputDir, "frame_%05d.jpg")
+	// drawtext burns the sequential frame number into the top-left corner.
+	filterStr := fmt.Sprintf(
+		"fps=%g,scale=640:-2,drawtext=text='%%{eif\\:n+1\\:d}':x=10:y=10:fontsize=28:fontcolor=white:borderw=2:bordercolor=black",
+		sampleRate,
+	)
+	outputPattern := filepath.Join(outputDir, "frame_%05d.jpg")
 
 	args := []string{
-		"-i", cfg.InputPath,
+		"-y",
+		"-i", inputPath,
 		"-vf", filterStr,
-		"-q:v", strconv.Itoa(cfg.Quality), // JPEG quality
+		"-q:v", "3",
 		"-f", "image2",
 		outputPattern,
 	}
@@ -81,17 +59,16 @@ func ExtractFrames(cfg FrameExtractionConfig) (*ExtractedFrames, error) {
 	cmd := exec.Command("ffmpeg", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("ffmpeg error: %w\noutput: %s", err, string(output))
+		return nil, fmt.Errorf("ffmpeg extract+label error: %w\noutput: %s", err, string(output))
 	}
 
-	// Collect output frame paths
-	paths, err := filepath.Glob(filepath.Join(cfg.OutputDir, "frame_*.jpg"))
+	paths, err := filepath.Glob(filepath.Join(outputDir, "frame_*.jpg"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to glob frames: %w", err)
 	}
+	sort.Strings(paths)
 
-	// Get source video metadata
-	meta, err := GetVideoMetadata(cfg.InputPath)
+	meta, err := GetVideoMetadata(inputPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get metadata: %w", err)
 	}
@@ -102,13 +79,81 @@ func ExtractFrames(cfg FrameExtractionConfig) (*ExtractedFrames, error) {
 		FPS:         meta.FPS,
 		DurationMs:  meta.DurationMs,
 		TotalFrames: meta.TotalFrames,
-		OutputDir:   cfg.OutputDir,
+		SampleRate:  sampleRate,
+		OutputDir:   outputDir,
 	}, nil
 }
 
-// GetVideoMetadata uses ffprobe to extract video info
+func CreateGridImages(framePaths []string, outputDir string) ([]string, error) {
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create grid dir: %w", err)
+	}
+
+	var gridPaths []string
+	total := len(framePaths)
+
+	for start := 0; start < total; start += framesPerGrid {
+		end := start + framesPerGrid
+		if end > total {
+			end = total
+		}
+		batch := framePaths[start:end]
+		gridIdx := start / framesPerGrid
+		gridPath := filepath.Join(outputDir, fmt.Sprintf("grid_%03d.jpg", gridIdx+1))
+
+		if err := createSingleGrid(batch, gridPath); err != nil {
+			return nil, fmt.Errorf("grid %d failed: %w", gridIdx+1, err)
+		}
+		gridPaths = append(gridPaths, gridPath)
+	}
+
+	return gridPaths, nil
+}
+
+func createSingleGrid(framePaths []string, outputPath string) error {
+	n := len(framePaths)
+	if n == 0 {
+		return fmt.Errorf("no frames to grid")
+	}
+
+	// Write a concat list so ffmpeg reads the frames as a sequence of single-frame videos.
+	listPath := outputPath + ".txt"
+	var listContent strings.Builder
+	for _, p := range framePaths {
+		abs, _ := filepath.Abs(p)
+		listContent.WriteString(fmt.Sprintf("file '%s'\n", filepath.ToSlash(abs)))
+		listContent.WriteString("duration 0.04\n")
+	}
+	if err := os.WriteFile(listPath, []byte(listContent.String()), 0644); err != nil {
+		return fmt.Errorf("failed to write concat list: %w", err)
+	}
+
+	// For the last batch with fewer than whatever frames, tile still works and
+	// fills missing cells with black.
+	tileLayout := fmt.Sprintf("%dx%d", gridCols, gridRows)
+
+	args := []string{
+		"-y",
+		"-f", "concat",
+		"-safe", "0",
+		"-i", listPath,
+		"-vf", fmt.Sprintf("scale=640:-2,tile=%s", tileLayout),
+		"-frames:v", "1",
+		"-q:v", "3",
+		outputPath,
+	}
+
+	cmd := exec.Command("ffmpeg", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg tile error: %w\noutput: %s", err, string(output))
+	}
+
+	os.Remove(listPath)
+	return nil
+}
+
 func GetVideoMetadata(videoPath string) (*VideoMetadata, error) {
-	// ffprobe outputs stream info as a flat key=value format
 	args := []string{
 		"-v", "error",
 		"-select_streams", "v:0",
@@ -127,7 +172,6 @@ func GetVideoMetadata(videoPath string) (*VideoMetadata, error) {
 	return parseFFprobeOutput(string(output))
 }
 
-// parseFFprobeOutput parses key=value lines from ffprobe output
 func parseFFprobeOutput(output string) (*VideoMetadata, error) {
 	meta := &VideoMetadata{}
 	lines := strings.Split(strings.TrimSpace(output), "\n")
@@ -142,17 +186,12 @@ func parseFFprobeOutput(output string) (*VideoMetadata, error) {
 		switch key {
 		case "width":
 			meta.Width, _ = strconv.Atoi(value)
-
 		case "height":
 			meta.Height, _ = strconv.Atoi(value)
-
 		case "r_frame_rate":
-			// format is "30/1" or "30000/1001" (for 29.97)
 			meta.FPS = parseFrameRate(value)
-
 		case "nb_frames":
 			meta.TotalFrames, _ = strconv.ParseInt(value, 10, 64)
-
 		case "duration":
 			dur, err := strconv.ParseFloat(value, 64)
 			if err == nil {
@@ -161,7 +200,6 @@ func parseFFprobeOutput(output string) (*VideoMetadata, error) {
 		}
 	}
 
-	// Fallback: calculate total frames if nb_frames is missing
 	if meta.TotalFrames == 0 && meta.FPS > 0 && meta.DurationMs > 0 {
 		meta.TotalFrames = int64(float64(meta.DurationMs) / 1000.0 * meta.FPS)
 	}
@@ -169,7 +207,6 @@ func parseFFprobeOutput(output string) (*VideoMetadata, error) {
 	return meta, nil
 }
 
-// parseFrameRate converts "30000/1001" or "30/1" to float64
 func parseFrameRate(value string) float64 {
 	parts := strings.Split(value, "/")
 	if len(parts) != 2 {
@@ -183,244 +220,80 @@ func parseFrameRate(value string) float64 {
 	return num / den
 }
 
-// CleanupFrames removes the temp frame directory after use
-func CleanupFrames(dir string) error {
-	return os.RemoveAll(dir)
-}
-
-// ApplyImpactEffects applies freeze-frame + B&W + vignette + zoom at each detected impact and produces a new video
-func ApplyImpactEffects(inputPath string, outputDir string, impacts []video.ImpactFrame, meta *VideoMetadata) (string, error) {
-	workDir := filepath.Join(outputDir, "processing")
-	if err := os.MkdirAll(workDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create processing dir: %w", err)
+// BuildImpactVideo takes the original video, the impact frame numbers (1-based,
+// at the sample rate), the sample rate, and produces a new video where those
+// frames (plus 1 before and 1 after) have invert + B&W effects applied.
+func BuildImpactVideo(inputPath, outputDir string, impactFrames []int, sampleRate float64, meta *VideoMetadata) (string, error) {
+	if len(impactFrames) == 0 {
+		return "", fmt.Errorf("no impact frames provided")
 	}
 
-	sort.Slice(impacts, func(i, j int) bool {
-		return impacts[i].TimestampMs < impacts[j].TimestampMs
-	})
-
-	w := meta.Width
-	h := meta.Height
-	if w%2 != 0 {
-		w--
-	}
-	if h%2 != 0 {
-		h--
-	}
-	fps := meta.FPS
-	if fps <= 0 {
-		fps = 30
+	type timeWindow struct {
+		start float64
+		end   float64
 	}
 
-	var segments []string
-	lastEndSec := 0.0
-	totalDurSec := float64(meta.DurationMs) / 1000.0
-
-	for i, impact := range impacts {
-		// Shift 100ms earlier so the freeze shows the moment just before contact
-		impactSec := float64(impact.TimestampMs)/1000.0 - 1
-		if impactSec < 0 {
-			impactSec = 0
+	var windows []timeWindow
+	for _, f := range impactFrames {
+		startFrame := f - 1
+		if startFrame < 1 {
+			startFrame = 1
 		}
-		if impactSec >= totalDurSec {
-			continue
-		}
+		endFrame := f + 1
 
-		// Normal segment before impact
-		if impactSec > lastEndSec+0.05 {
-			segPath := filepath.Join(workDir, fmt.Sprintf("seg_%d.mp4", i*2))
-			duration := impactSec - lastEndSec
-			if err := ffmpegExtractSegment(inputPath, lastEndSec, duration, segPath, w, h, fps); err != nil {
-				log.Printf("Warning: segment extraction failed: %v", err)
-			} else {
-				segments = append(segments, segPath)
+		startTime := float64(startFrame-1) / sampleRate
+		endTime := float64(endFrame) / sampleRate
+		windows = append(windows, timeWindow{startTime, endTime})
+	}
+
+	// Sort and merge overlapping windows
+	sort.Slice(windows, func(i, j int) bool { return windows[i].start < windows[j].start })
+	var merged []timeWindow
+	for _, w := range windows {
+		if len(merged) > 0 && w.start <= merged[len(merged)-1].end {
+			if w.end > merged[len(merged)-1].end {
+				merged[len(merged)-1].end = w.end
 			}
-		}
-
-		// Extract impact frame as image
-		framePath := filepath.Join(workDir, fmt.Sprintf("impact_%d.jpg", i))
-		if err := ffmpegExtractFrame(inputPath, impactSec, framePath); err != nil {
-			log.Printf("Warning: frame extraction failed: %v", err)
-			continue
-		}
-
-		// Create freeze clip with effects
-		freezePath := filepath.Join(workDir, fmt.Sprintf("freeze_%d.mp4", i))
-		freezeDur := float64(impact.FreezeFrame.FreezeDurationMs) / 1000.0
-		if freezeDur < 0.05 {
-			freezeDur = 0.15 // default 150ms — short and punchy
-		}
-		if freezeDur > 0.15 {
-			freezeDur = 0.15 // cap at 150ms
-		}
-		if err := ffmpegCreateFreezeClip(framePath, freezePath, freezeDur, impact, w, h, fps); err != nil {
-			log.Printf("Warning: freeze clip creation failed: %v", err)
-			continue
-		}
-		segments = append(segments, freezePath)
-
-		lastEndSec = impactSec + (1.0 / fps)
-	}
-
-	// Final segment after last impact
-	if lastEndSec < totalDurSec-0.05 {
-		segPath := filepath.Join(workDir, "seg_final.mp4")
-		duration := totalDurSec - lastEndSec
-		if err := ffmpegExtractSegment(inputPath, lastEndSec, duration, segPath, w, h, fps); err != nil {
-			log.Printf("Warning: final segment extraction failed: %v", err)
 		} else {
-			segments = append(segments, segPath)
+			merged = append(merged, w)
 		}
 	}
 
-	if len(segments) == 0 {
-		return "", fmt.Errorf("no segments were created")
+	// Build enable expression: between(t,s1,e1)+between(t,s2,e2)+...
+	var parts []string
+	for _, w := range merged {
+		parts = append(parts, fmt.Sprintf("between(t\\,%.3f\\,%.3f)", w.start, w.end))
 	}
+	enableExpr := strings.Join(parts, "+")
+
+	log.Printf("[effects] %d impact points -> %d merged time windows, enable=%s", len(impactFrames), len(merged), enableExpr)
+
+	// Apply effect filters only during impact windows, preserving original framerate.
+	filter := fmt.Sprintf(
+		"hue=s=0:enable='%s',eq=contrast=2.0:brightness=0.1:enable='%s',curves=all='0/0 0.25/0.1 0.5/0.6 0.75/0.95 1/1':enable='%s'",
+		enableExpr, enableExpr, enableExpr,
+	)
 
 	outputPath := filepath.Join(outputDir, "output.mp4")
-	if err := ffmpegConcat(segments, outputPath, workDir); err != nil {
-		return "", fmt.Errorf("concat failed: %w", err)
-	}
-
-	return outputPath, nil
-}
-
-func ffmpegExtractSegment(inputPath string, startSec, duration float64, outputPath string, w, h int, fps float64) error {
 	args := []string{
 		"-y",
 		"-i", inputPath,
-		"-ss", fmt.Sprintf("%.3f", startSec),
-		"-t", fmt.Sprintf("%.3f", duration),
-		"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,fps=%g", w, h, w, h, fps),
+		"-vf", filter,
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
-		"-crf", "23",
+		"-crf", "18",
 		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
 		"-b:a", "128k",
-		outputPath,
-	}
-	cmd := exec.Command("ffmpeg", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ffmpeg segment error: %w\noutput: %s", err, string(output))
-	}
-	return nil
-}
-
-func ffmpegExtractFrame(inputPath string, timestampSec float64, outputPath string) error {
-	args := []string{
-		"-y",
-		"-i", inputPath,
-		"-ss", fmt.Sprintf("%.3f", timestampSec),
-		"-frames:v", "1",
-		"-q:v", "2",
-		outputPath,
-	}
-	cmd := exec.Command("ffmpeg", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ffmpeg frame extract error: %w\noutput: %s", err, string(output))
-	}
-	return nil
-}
-
-func ffmpegCreateFreezeClip(framePath, outputPath string, duration float64, impact video.ImpactFrame, w, h int, fps float64) error {
-	var filters []string
-
-	filters = append(filters, fmt.Sprintf("fps=%g", fps))
-
-	// High-contrast invert: brightened background with darkened subjects
-	// Gentle version — subjects remain clearly visible
-	if impact.InvertFilter.Enabled && impact.InvertFilter.InvertStrength > 0 {
-		strength := impact.InvertFilter.InvertStrength
-		if strength > 1.0 {
-			strength = 1.0
-		}
-		// Partial desaturation — keep some color at low strength
-		saturation := 1.0 - (strength * 0.8) // 0.2 to 1.0 remaining
-		filters = append(filters, fmt.Sprintf("hue=s=%.2f", saturation))
-		// Moderate contrast boost — keep details visible
-		contrastVal := 1.2 + (strength * 0.6)    // 1.2 to 1.8
-		brightnessVal := 0.05 + (strength * 0.1) // slight brightness lift
-		filters = append(filters, fmt.Sprintf("eq=contrast=%.2f:brightness=%.2f", contrastVal, brightnessVal))
-		// Gentle curves — lighten highlights, slightly darken shadows
-		filters = append(filters, "curves=all='0/0 0.25/0.15 0.5/0.55 0.75/0.9 1/1'")
-	} else if impact.BWFilter.Enabled {
-		// Standard B&W with high contrast
-		saturation := 1.0 - impact.BWFilter.BWIntensity
-		if saturation < 0 {
-			saturation = 0
-		}
-		filters = append(filters, fmt.Sprintf("hue=s=%.2f", saturation))
-		if impact.BWFilter.ContrastBoost > 1.0 {
-			filters = append(filters, fmt.Sprintf("eq=contrast=%.2f", impact.BWFilter.ContrastBoost))
-		}
-	}
-
-	if impact.Vignette.Enabled {
-		filters = append(filters, "vignette")
-	}
-
-	if impact.Zoom.Enabled && impact.Zoom.ZoomFactor > 1.0 {
-		zf := impact.Zoom.ZoomFactor
-		filters = append(filters, fmt.Sprintf("scale=iw*%.2f:ih*%.2f", zf, zf))
-		filters = append(filters, fmt.Sprintf("crop=%d:%d", w, h))
-	}
-
-	filters = append(filters, fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2", w, h, w, h))
-	filters = append(filters, "format=yuv420p")
-
-	filterStr := strings.Join(filters, ",")
-
-	args := []string{
-		"-y",
-		"-loop", "1",
-		"-i", framePath,
-		"-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-		"-t", fmt.Sprintf("%.3f", duration),
-		"-vf", filterStr,
-		"-c:v", "libx264",
-		"-preset", "ultrafast",
-		"-crf", "23",
-		"-pix_fmt", "yuv420p",
-		"-c:a", "aac",
-		"-b:a", "128k",
-		"-shortest",
-		outputPath,
-	}
-	cmd := exec.Command("ffmpeg", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ffmpeg freeze clip error: %w\noutput: %s", err, string(output))
-	}
-	return nil
-}
-
-func ffmpegConcat(segments []string, outputPath, workDir string) error {
-	listPath := filepath.Join(workDir, "concat_list.txt")
-	var content strings.Builder
-	for _, seg := range segments {
-		absPath, _ := filepath.Abs(seg)
-		content.WriteString(fmt.Sprintf("file '%s'\n", filepath.ToSlash(absPath)))
-	}
-	if err := os.WriteFile(listPath, []byte(content.String()), 0644); err != nil {
-		return fmt.Errorf("failed to write concat list: %w", err)
-	}
-
-	args := []string{
-		"-y",
-		"-f", "concat",
-		"-safe", "0",
-		"-i", listPath,
-		"-c", "copy",
 		"-movflags", "+faststart",
 		outputPath,
 	}
+
 	cmd := exec.Command("ffmpeg", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("ffmpeg concat error: %w\noutput: %s", err, string(output))
+		return "", fmt.Errorf("ffmpeg effect error: %w\noutput: %s", err, string(output))
 	}
-	return nil
+
+	return outputPath, nil
 }

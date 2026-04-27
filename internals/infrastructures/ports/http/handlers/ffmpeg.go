@@ -6,8 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,7 +31,10 @@ func NewFFMPEGHandler(environmentVariables *env.EnvironmentVariables, llm domain
 	}
 }
 
-const maxFileSize = 1000 << 20
+const (
+	maxFileSize = 1000 << 20
+	sampleRate  = 10.0
+)
 
 func (h *Handler) ExtractFrames(c *gin.Context) {
 	// 1. Receive the uploaded video
@@ -51,13 +52,6 @@ func (h *Handler) ExtractFrames(c *gin.Context) {
 		return
 	}
 
-	sampleRate := 1.0
-	if sr := c.PostForm("sample_rate"); sr != "" {
-		if parsed, err := strconv.ParseFloat(sr, 64); err == nil {
-			sampleRate = parsed
-		}
-	}
-
 	// 2. Save uploaded file to temp location
 	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
 	tempDir := filepath.Join("tmp", sessionID)
@@ -72,61 +66,59 @@ func (h *Handler) ExtractFrames(c *gin.Context) {
 		return
 	}
 
-	// 3. Extract frames with FFmpeg
-	framesDir := filepath.Join(tempDir, "frames")
-	extracted, err := videoService.ExtractFrames(videoService.FrameExtractionConfig{
-		InputPath:  inputPath,
-		OutputDir:  framesDir,
-		SampleRate: sampleRate,
-		MaxWidth:   1280,
-		MaxHeight:  720,
-		Quality:    3,
-	})
+	// 3. Extract frames at 10fps with numbered labels burned in
+	framesDir := filepath.Join(tempDir, "labeled_frames")
+	extracted, err := videoService.ExtractAndLabelFrames(inputPath, framesDir, sampleRate)
 	if err != nil {
 		response.NewErrorResponse(errors.InternalServerError(err)).Send(c)
 		return
 	}
 
-	log.Printf("[pipeline] Extracted %d frames from video", extracted.FrameCount)
+	log.Printf("[pipeline] Extracted %d labeled frames at %.0ffps", extracted.FrameCount, sampleRate)
 
-	// 4. Upload extracted frames to Gemini
-	sort.Strings(extracted.Paths)
+	// 4. Create 5x4 grids from labeled frames
+	gridsDir := filepath.Join(tempDir, "grids")
+	gridPaths, err := videoService.CreateGridImages(extracted.Paths, gridsDir)
+	if err != nil {
+		response.NewErrorResponse(errors.InternalServerError(fmt.Errorf("failed to create grids: %w", err))).Send(c)
+		return
+	}
+
+	log.Printf("[pipeline] Created %d grid images from %d frames", len(gridPaths), extracted.FrameCount)
+
+	// 5. Upload grid images to Gemini
 	var llmFiles []domainLLM.File
-	for _, path := range extracted.Paths {
+	for _, gp := range gridPaths {
 		llmFiles = append(llmFiles, domainLLM.File{
-			Path:     path,
+			Path:     gp,
 			MIMEType: "image/jpeg",
 		})
 	}
 
-	log.Printf("[pipeline] Uploading %d frames to Gemini...", len(llmFiles))
+	log.Printf("[pipeline] Uploading %d grid images to Gemini...", len(llmFiles))
 	uploadedFiles, err := h.llm.UploadFiles(llmFiles)
 	if err != nil {
-		response.NewErrorResponse(errors.InternalServerError(fmt.Errorf("failed to upload frames: %w", err))).Send(c)
+		response.NewErrorResponse(errors.InternalServerError(fmt.Errorf("failed to upload grids: %w", err))).Send(c)
 		return
 	}
 
-	// 5. Build prompt with system instructions + video metadata
+	// 6. Build prompt
 	systemPrompt := loadSystemPrompt()
 
-	var frameInfo strings.Builder
-	for i, path := range extracted.Paths {
-		frameNum := extractFrameNumber(filepath.Base(path))
-		timestampMs := int64(float64(frameNum-1) / sampleRate * 1000)
-		fmt.Fprintf(&frameInfo, "- Image %d: frame_index=%d, timestamp=%dms\n", i+1, frameNum-1, timestampMs)
-	}
+	userPrompt := fmt.Sprintf(`Analyze these video frame grids for key action moments.
 
-	userPrompt := fmt.Sprintf(`Analyze these video frames for impact moments.
+Each grid is a 5x2 layout (5 columns, 2 rows) of sequential frames.
+Each frame has a number label in the top-left corner -- that is the frame number.
+Frames are extracted at %.0f frames per second from the original video.
 
-Video metadata:
-- FPS: %.2f
-- Total frames: %d
+Video info:
+- Original FPS: %.2f
 - Duration: %dms
-- Sample rate: %.1f frames/sec
-- Sampled frames: %d
+- Total labeled frames: %d
+- Grids provided: %d (10 frames per grid)
 
-Frame mapping (in order of provided images):
-%s`, extracted.FPS, extracted.TotalFrames, extracted.DurationMs, sampleRate, extracted.FrameCount, frameInfo.String())
+Return ONLY the JSON object with frame numbers where key action moments occur.`,
+		sampleRate, extracted.FPS, extracted.DurationMs, extracted.FrameCount, len(gridPaths))
 
 	fullPrompt := systemPrompt + "\n\n---\n\n" + userPrompt
 
@@ -139,38 +131,38 @@ Frame mapping (in order of provided images):
 
 	log.Printf("[pipeline] LLM response received (cost: $%.6f)", llmResponse.Dollars)
 
-	// 6. Parse LLM JSON response
-	var impactAnalysis domainVideo.ImpactAnalysisResponse
+	// 7. Parse LLM response -- just an array of frame numbers
+	var impactResponse domainVideo.ImpactResponse
 	jsonStr := extractJSON(llmResponse.Response)
-	if err := json.Unmarshal([]byte(jsonStr), &impactAnalysis); err != nil {
+	if err := json.Unmarshal([]byte(jsonStr), &impactResponse); err != nil {
 		log.Printf("[pipeline] Raw LLM response:\n%s", llmResponse.Response)
 		response.NewErrorResponse(errors.InternalServerError(fmt.Errorf("failed to parse LLM response: %w", err))).Send(c)
 		return
 	}
 
-	log.Printf("[pipeline] Detected %d impact moments", impactAnalysis.VideoAnalysis.TotalImpactsDetected)
+	log.Printf("[pipeline] Detected %d impact frames: %v", len(impactResponse.Impacts), impactResponse.Impacts)
 
-	// 7. If no impacts, return original video
-	if len(impactAnalysis.ImpactFrames) == 0 {
+	// 8. If no impacts, return original video
+	if len(impactResponse.Impacts) == 0 {
 		response.NewSuccessResponse("No impact moments detected", gin.H{
 			"download_url": fmt.Sprintf("/downloads/%s/%s", sessionID, file.Filename),
-			"analysis":     impactAnalysis,
+			"impacts":      impactResponse.Impacts,
 			"llm_cost":     llmResponse.Dollars,
 		}, nil).Send(c)
 		return
 	}
 
-	// 8. Apply FFmpeg effects at impact moments
+	// 9. Build impact video: apply B&W+invert to impact frames +/- 1
 	meta, err := videoService.GetVideoMetadata(inputPath)
 	if err != nil {
 		response.NewErrorResponse(errors.InternalServerError(fmt.Errorf("failed to get video metadata: %w", err))).Send(c)
 		return
 	}
 
-	log.Printf("[pipeline] Applying impact effects to video (%dx%d, %.1ffps)...", meta.Width, meta.Height, meta.FPS)
-	outputPath, err := videoService.ApplyImpactEffects(inputPath, tempDir, impactAnalysis.ImpactFrames, meta)
+	log.Printf("[pipeline] Building impact video (%dx%d, %.1ffps)...", meta.Width, meta.Height, meta.FPS)
+	outputPath, err := videoService.BuildImpactVideo(inputPath, tempDir, impactResponse.Impacts, sampleRate, meta)
 	if err != nil {
-		response.NewErrorResponse(errors.InternalServerError(fmt.Errorf("failed to apply effects: %w", err))).Send(c)
+		response.NewErrorResponse(errors.InternalServerError(fmt.Errorf("failed to build impact video: %w", err))).Send(c)
 		return
 	}
 
@@ -181,7 +173,7 @@ Frame mapping (in order of provided images):
 
 	response.NewSuccessResponse("Impact video generated successfully", gin.H{
 		"download_url": downloadURL,
-		"analysis":     impactAnalysis,
+		"impacts":      impactResponse.Impacts,
 		"llm_cost":     llmResponse.Dollars,
 	}, nil).Send(c)
 }
@@ -209,20 +201,11 @@ func extractJSON(s string) string {
 			return strings.TrimSpace(s[:end])
 		}
 	}
+
 	start := strings.Index(s, "{")
 	end := strings.LastIndex(s, "}")
 	if start != -1 && end > start {
 		return s[start : end+1]
 	}
 	return s
-}
-
-func extractFrameNumber(filename string) int {
-	name := strings.TrimSuffix(filename, filepath.Ext(filename))
-	parts := strings.Split(name, "_")
-	if len(parts) < 2 {
-		return 1
-	}
-	num, _ := strconv.Atoi(parts[len(parts)-1])
-	return num
 }
