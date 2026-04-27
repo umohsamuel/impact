@@ -1,17 +1,21 @@
 # Impact
 
-An AI-powered video processing API that detects high-impact moments in short-form video content and applies cinematic freeze-frame effects at those moments. It uses Google Gemini's vision capabilities to analyze extracted video frames, identify points of forceful contact (punches, collisions, strikes, energy blasts, etc.), and then uses FFmpeg to splice stylized freeze-frame clips into the video at each impact timestamp.
+An AI-powered video processing API that detects high-impact moments in short-form video content and applies dramatic visual effects at those moments. It uses Google Gemini's vision capabilities to analyze video frame grids, identify frames where significant physical contact occurs, and applies a high-contrast B&W effect to those moments — all while preserving the original video's native framerate.
 
-Built for anime fight scenes, sports highlights, movie clips, and similar content where brief paused-and-styled frames at the moment of contact can add visual punch.
+Built for anime fight scenes, sports highlights, movie clips, and similar content where styled impact frames add visual punch.
+
+## Example Output
+
+[Watch an example processed video on Google Drive](https://drive.google.com/file/d/1U9a3cpHXVYLg69MEpGD4vF-DuBEgP_j2/view?usp=sharing)
 
 ## How It Works
 
 1. A video is uploaded via the REST API.
-2. FFmpeg extracts frames at a configurable sample rate (default: 1 frame/sec).
-3. The extracted frames are uploaded to Google Gemini.
-4. Gemini analyzes the full sequence of frames using a detailed system prompt that enforces a force-transfer test and multiple rejection filters (black screens, transitions, cutaways, etc.).
-5. The model returns structured JSON with timestamps, confidence scores, and per-impact effect parameters (freeze duration, invert strength, B&W contrast, zoom, vignette).
-6. The pipeline splits the original video into segments around each impact timestamp, generates a short freeze-frame clip with the specified visual effects applied via FFmpeg filters, and concatenates everything back together.
+2. FFmpeg extracts frames at 10fps and burns a visible frame number label onto each one.
+3. The labeled frames are arranged into 5x4 grids (20 frames per grid) to reduce the number of images sent to the model.
+4. The grid images are uploaded to Google Gemini via the File API.
+5. Gemini analyzes all grids and returns a JSON array of frame numbers where key action moments (physical contact, collisions, strikes) occur.
+6. The frame numbers are converted to timestamps, and FFmpeg applies a high-contrast B&W effect directly to the original video at those moments (±2 frames), preserving the native framerate.
 7. The processed video is served as a static download.
 
 ## Architecture
@@ -34,7 +38,7 @@ internals/
       adapters.go                     Wires DB queries + LLM adapter
       llm/command.go                  Gemini API adapter (upload, generate, cost calc)
       user/command.go                 User adapter (placeholder)
-      video/command.go                FFmpeg operations (extract, metadata, effects, concat)
+      video/command.go                FFmpeg operations (extract, label, grid, effects)
     db/
       db.go                           pgxpool creation
       gen/                            sqlc-generated query code
@@ -42,7 +46,7 @@ internals/
       queries/users.sql               SQL for user CRUD
     domain/
       llm/                            LLM types (Response, File, UploadedFile) + interface
-      video/                          Video types (ImpactFrame, effect configs, analysis response)
+      video/                          Video types (ImpactResponse with frame numbers)
     ports/
       ports.go                        Port wrapper
       http/
@@ -144,7 +148,7 @@ GET /health
 
 Returns a simple status message confirming the server is running.
 
-### Generate Impact Frames
+### Generate Impact Video
 
 ```
 POST /api/v1/generate-impact-frames
@@ -153,10 +157,11 @@ Content-Type: multipart/form-data
 
 **Form fields:**
 
-| Field         | Type  | Required | Description                                                |
-| ------------- | ----- | -------- | ---------------------------------------------------------- |
-| `video`       | file  | Yes      | Video file (max 1 GB)                                      |
-| `sample_rate` | float | No       | Frames per second to extract for analysis (default: `1.0`) |
+| Field   | Type | Required | Description           |
+| ------- | ---- | -------- | --------------------- |
+| `video` | file | Yes      | Video file (max 1 GB) |
+
+Frames are extracted at a fixed rate of 10fps. No sample rate parameter is needed.
 
 **Response:**
 
@@ -166,39 +171,7 @@ Content-Type: multipart/form-data
   "message": "Impact video generated successfully",
   "data": {
     "download_url": "/downloads/{sessionID}/output.mp4",
-    "analysis": {
-      "video_analysis": {
-        "total_impacts_detected": 3,
-        "overall_intensity": "high",
-        "content_type": "action",
-        "processing_notes": "Fight scene with multiple strikes"
-      },
-      "impact_frames": [
-        {
-          "impact_id": 1,
-          "frame_index": 45,
-          "timestamp_ms": 1500,
-          "impact_type": "physical",
-          "impact_label": "Right hook connects",
-          "confidence": 0.95,
-          "intensity": "strong",
-          "freeze_frame": { "enabled": true, "freeze_duration_ms": 150 },
-          "invert_filter": { "enabled": true, "invert_strength": 0.6 },
-          "bw_filter": {
-            "enabled": false,
-            "bw_intensity": 0,
-            "contrast_boost": 1
-          },
-          "zoom": {
-            "enabled": true,
-            "zoom_factor": 1.15,
-            "zoom_duration_ms": 100
-          },
-          "vignette": { "enabled": true, "vignette_strength": 0.5 },
-          "slowdown": { "enabled": false }
-        }
-      ]
-    },
+    "impacts": [12, 45, 78],
     "llm_cost": 0.003421
   }
 }
@@ -214,31 +187,29 @@ Static file serving from the `tmp/` directory. The download URL is included in t
 
 ## Impact Detection
 
-The system prompt instructs Gemini to follow a strict detection process:
+The system prompt instructs Gemini to analyze 5x4 frame grids and identify the exact frames where physical contact occurs. The detection process:
 
-1. **Scene understanding** -- look at the full frame sequence to understand context.
-2. **Candidate identification** -- find moments where two things make contact with force.
-3. **Rejection filters** -- each candidate is checked against multiple filters:
+1. **Scene understanding** -- look at all grids to understand the full video context.
+2. **Contact identification** -- find frames where two things make significant physical contact (strikes connecting, collisions, objects breaking, projectiles hitting targets).
+3. **Rejection filters** -- each candidate is checked:
    - No actual contact between objects? Reject.
    - Black screen, white screen, or solid color? Reject.
    - Scene transition, cutaway, or text overlay? Reject.
    - Wind-up or aftermath rather than the contact frame? Reject.
-   - Too weak or ambiguous? Reject.
-4. **Final selection** -- only the strongest, cleanest impacts survive. Quality over quantity.
+   - Movement without contact (running, jumping)? Reject.
+4. **Final selection** -- only the 2-5 best, clearest impact frames are returned.
 
-The core test applied to every candidate: "Are two things making forceful contact right now?" If not, it gets rejected.
+The model returns a simple JSON object: `{"impacts": [12, 45, 78]}` where each number corresponds to a labeled frame.
 
 ## Visual Effects
 
-Each detected impact gets a short freeze-frame clip with configurable FFmpeg filters:
+Impact frames (±2 frames around each detected moment) receive a dramatic B&W effect applied directly to the original video stream:
 
-- **Freeze frame**: A brief pause (80-350ms) at the moment of contact.
-- **Invert/high-contrast**: A washed-out, high-contrast look. Partial desaturation, moderate contrast boost, gentle curve adjustment. Subjects remain visible and recognizable.
-- **Black and white**: Desaturation with configurable contrast boost for a stark, punchy look.
-- **Zoom**: A quick scale punch that zooms in slightly on the impact point.
-- **Vignette**: Darkened edges for cinematic framing.
+- **Full desaturation** via `hue=s=0`
+- **High contrast + brightness boost** via `eq=contrast=2.0:brightness=0.1`
+- **Custom tone curve** via `curves` for a punchy, manga-style look
 
-The model decides which effects to enable and at what intensity for each impact based on how powerful the hit looks.
+Effects are applied using FFmpeg's `enable='between(t,...)'` expressions, which means the original video's native framerate is preserved — no frame extraction or reassembly needed for the output.
 
 ## LLM Cost Tracking
 
@@ -254,21 +225,6 @@ Core dependencies from `go.mod`:
 - [joho/godotenv](https://github.com/joho/godotenv) -- .env file loading
 - [markbates/goth](https://github.com/markbates/goth) -- OAuth providers (Google, GitHub)
 - [google.golang.org/genai](https://pkg.go.dev/google.golang.org/genai) -- Google Gemini API client
-
-## Database
-
-PostgreSQL with [sqlc](https://sqlc.dev/) for type-safe query generation. The current schema has a single `users` table:
-
-```sql
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  name TEXT NOT NULL
-);
-```
-
-An `updated_at` trigger automatically updates the timestamp on row changes. Migrations are managed with [Goose](https://github.com/pressly/goose).
 
 ## License
 

@@ -107,7 +107,7 @@ func (h *Handler) ExtractFrames(c *gin.Context) {
 
 	userPrompt := fmt.Sprintf(`Analyze these video frame grids for key action moments.
 
-Each grid is a 5x2 layout (5 columns, 2 rows) of sequential frames.
+Each grid is a 5x4 layout (5 columns, 4 rows) of sequential frames.
 Each frame has a number label in the top-left corner -- that is the frame number.
 Frames are extracted at %.0f frames per second from the original video.
 
@@ -115,7 +115,7 @@ Video info:
 - Original FPS: %.2f
 - Duration: %dms
 - Total labeled frames: %d
-- Grids provided: %d (10 frames per grid)
+- Grids provided: %d (20 frames per grid)
 
 Return ONLY the JSON object with frame numbers where key action moments occur.`,
 		sampleRate, extracted.FPS, extracted.DurationMs, extracted.FrameCount, len(gridPaths))

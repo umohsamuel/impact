@@ -235,7 +235,7 @@ func BuildImpactVideo(inputPath, outputDir string, impactFrames []int, sampleRat
 
 	var windows []timeWindow
 	for _, f := range impactFrames {
-		startFrame := f - 1
+		startFrame := f
 		if startFrame < 1 {
 			startFrame = 1
 		}
@@ -270,7 +270,7 @@ func BuildImpactVideo(inputPath, outputDir string, impactFrames []int, sampleRat
 
 	// Apply effect filters only during impact windows, preserving original framerate.
 	filter := fmt.Sprintf(
-		"hue=s=0:enable='%s',eq=contrast=2.0:brightness=0.1:enable='%s',curves=all='0/0 0.25/0.1 0.5/0.6 0.75/0.95 1/1':enable='%s'",
+		"hue=s=0:enable='%s',eq=contrast=3.5:brightness=0.9:enable='%s',curves=all='0/0 0.25/0.1 0.5/0.6 0.75/0.95 1/1':enable='%s'",
 		enableExpr, enableExpr, enableExpr,
 	)
 
